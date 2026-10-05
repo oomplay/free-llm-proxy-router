@@ -304,10 +304,20 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		}
 		body := copyMap(raw)
 		body["model"] = e.ModelID
-		delete(body, "stream")
 		for _, f := range anthropicOnlyFields {
 			delete(body, f)
 		}
+		if req.Stream {
+			// Streaming request: same SSE pass-through and fallback
+			// semantics as the alias route. canonicalModel is empty here —
+			// the direct route reports no X-Used-Model on success, matching
+			// its buffered behavior.
+			if !s.streamOneCandidate(w, r, provCfg, body, "", req.Model, "direct route") {
+				continue
+			}
+			return
+		}
+		delete(body, "stream") // buffered path: fallback requires complete JSON
 		resp, err := chain.callProvider(r.Context(), *provCfg, body)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			w.Header().Set("Content-Type", "application/json")
@@ -372,10 +382,20 @@ func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *co
 		}
 		body := copyMap(raw)
 		body["model"] = u.ModelID
-		delete(body, "stream")
 		for _, f := range anthropicOnlyFields {
 			delete(body, f)
 		}
+		if req.Stream {
+			// Streaming request: keep stream:true in the body and pass the
+			// upstream SSE through incrementally. streamOneCandidate only
+			// walks to the next candidate while nothing has been written
+			// downstream; once the stream starts the attempt is terminal.
+			if !s.streamOneCandidate(w, r, provCfg, body, req.Model, req.Model, "alias route") {
+				continue
+			}
+			return true
+		}
+		delete(body, "stream") // buffered path: fallback requires complete JSON
 		resp, err := chain.callProvider(r.Context(), *provCfg, body)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Printf("alias route: %s/%s served %q", u.ProviderID, u.ModelID, req.Model)

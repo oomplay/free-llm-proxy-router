@@ -265,15 +265,20 @@ The `.env` file is gitignored. See `.env.example` for all supported keys.
 
 ## Known limitations
 
-- **Streaming (`stream: true`) is not proxied as SSE.** The proxy always
-  requests non-streaming responses from providers and returns complete JSON:
-  `stream` is stripped from upstream request bodies (`buildBody`) so the
-  fallback chain can buffer responses, and `StreamProxy.Forward` — the SSE
-  pass-through helper — is currently never invoked. Clients therefore receive
-  HTTP 200 with the complete completion body instead of an SSE event stream,
-  regardless of the `stream` flag. This is a pre-existing, proxy-wide design
-  limitation (it affects raw-model requests and canonical-alias requests
-  alike), not part of the canonical alias feature.
+- **Streaming (`stream: true`) is proxied as real SSE on the raw-model and
+  canonical-alias routes.** When the upstream answers `text/event-stream`,
+  the proxy pumps the bytes through incrementally (per-read flush) — clients
+  see `data: {...}` chunks and `data: [DONE]` as the upstream produces them.
+  Fallback between candidates happens only before the first downstream byte;
+  once a stream has started, a mid-stream failure truncates the stream rather
+  than splicing in another candidate's generation. If the client disconnects,
+  the upstream request context is canceled so no inference keeps running.
+  Upstreams that answer `stream: true` with a plain JSON body (ignoring the
+  flag) are forwarded as `application/json` — JSON is never disguised as an
+  event stream. Remaining scope: requests that reach the strategy chain
+  (`model: "auto"` / strategy names, or an alias/raw route whose candidates
+  all failed) still return buffered JSON, and the upstream HTTP client's
+  120-second timeout also bounds stream duration.
 
 ## Development
 
