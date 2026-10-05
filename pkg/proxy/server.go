@@ -35,6 +35,12 @@ type Server struct {
 	// every config or catalog reload. A nil result (aliasing disabled) means
 	// requests keep using raw model IDs only.
 	aliasRes atomic.Pointer[alias.Resolver]
+
+	// chainHTTPClient, when set, replaces the default 120s upstream HTTP
+	// client used by the direct, alias, and strategy routes. Tests inject a
+	// short-timeout client to exercise timeout classification without
+	// slowing the suite.
+	chainHTTPClient *http.Client
 }
 
 // NewServer creates a new proxy Server.
@@ -99,6 +105,16 @@ func buildAliasResolver(cfg *config.Config, cat *catalog.Catalog) *alias.Resolve
 		FreeOnly: cfg.Models.Canonicalization.FreeOnly,
 		Reserved: reserved,
 	})
+}
+
+// upstreamHTTPClient returns the HTTP client used for upstream calls from
+// the direct, alias, and strategy routes. Tests may inject a short-timeout
+// client via chainHTTPClient; production uses a 120s default.
+func (s *Server) upstreamHTTPClient() *http.Client {
+	if s.chainHTTPClient != nil {
+		return s.chainHTTPClient
+	}
+	return &http.Client{Timeout: 120 * time.Second}
 }
 
 // Start begins listening on the configured port.
@@ -272,7 +288,7 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		RateLimiter:        s.rateLimiter,
 		GeminiTracker:      s.geminiTracker,
 		ReliabilityTracker: s.reliabilityTracker,
-		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		HTTPClient:         s.upstreamHTTPClient(),
 		Resolver:           resolver,
 	}
 
@@ -299,7 +315,19 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 			w.Write(resp.Body)
 			return
 		}
-		// Any error or non-2xx — try next catalog entry.
+		// Non-retryable client/request errors (400, 401, 403, …) surface
+		// immediately: no next catalog entry, no strategy chain, and no
+		// masked success. Availability failures keep walking below.
+		if classifyUpstreamFailure(resp, err) == nonRetryable {
+			if resp != nil {
+				log.Printf("direct route: %s/%s non-retryable status %d — surfacing to client", e.ProviderID, e.ModelID, resp.StatusCode)
+				s.writeUpstreamError(w, req.Model, resp)
+			} else {
+				log.Printf("direct route: %s/%s request canceled — aborting walk", e.ProviderID, e.ModelID)
+			}
+			return
+		}
+		// Any retryable error or non-2xx — try next catalog entry.
 	}
 	if !found {
 		if s.serveAliasModel(w, r, cfg, cat, req, raw, resolver) {
@@ -334,7 +362,7 @@ func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *co
 		RateLimiter:        s.rateLimiter,
 		GeminiTracker:      s.geminiTracker,
 		ReliabilityTracker: s.reliabilityTracker,
-		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		HTTPClient:         s.upstreamHTTPClient(),
 		Resolver:           resolver,
 	}
 	for _, u := range ups {
@@ -368,9 +396,22 @@ func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *co
 			w.Write(resp.Body)
 			return true
 		}
-		// Upstream failed — record the candidate and the failure class,
-		// then try the next one (cooldown/retry already handled by
-		// callProvider callers upstream of this point).
+		// Client/request errors (400, 401, 403, …) must not walk more
+		// candidates: no other upstream can succeed with the same payload,
+		// and continuing would mask the real error behind an exhaustion
+		// response. Surface the upstream response to the client as-is.
+		if classifyUpstreamFailure(resp, err) == nonRetryable {
+			if resp != nil {
+				log.Printf("alias route: %s/%s non-retryable status %d — surfacing to client, no further candidates", u.ProviderID, u.ModelID, resp.StatusCode)
+				s.writeUpstreamError(w, req.Model, resp)
+			} else {
+				log.Printf("alias route: %s/%s request canceled — aborting candidate walk", u.ProviderID, u.ModelID)
+			}
+			return true
+		}
+		// Retryable upstream failure — record the candidate and the
+		// failure class, then try the next one (cooldown/retry already
+		// handled by callProvider callers upstream of this point).
 		if err != nil {
 			log.Printf("alias route: %s/%s error: %v — trying next candidate", u.ProviderID, u.ModelID, err)
 		} else {
@@ -423,7 +464,7 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 		RateLimiter:        s.rateLimiter,
 		GeminiTracker:      s.geminiTracker,
 		ReliabilityTracker: s.reliabilityTracker,
-		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		HTTPClient:         s.upstreamHTTPClient(),
 		Resolver:           s.aliasRes.Load(),
 	}
 

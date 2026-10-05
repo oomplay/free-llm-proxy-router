@@ -66,7 +66,13 @@ type Response struct {
 }
 
 // Execute runs the fallback chain for the given request.
-// Returns the first successful response or an error if all providers fail.
+//
+// Returns the first successful response, the first non-retryable upstream
+// error response (client/request errors such as 400/401/403 are surfaced to
+// the caller as-is instead of being retried — see classifyUpstreamFailure),
+// or an error when every candidate failed with a retryable failure. Only
+// genuine candidate exhaustion produces an error; callers turn that into the
+// exhaustion response.
 func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, error) {
 	freeEntries := fc.Catalog.FreeEntries()
 	stratReq := strategy.Request{
@@ -91,6 +97,13 @@ func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, e
 			resp, err := fc.callProvider(ctx, *or, body)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				fc.ReliabilityTracker.Record("openrouter", true)
+				return resp, nil
+			}
+			// Non-retryable client/request errors abort the whole chain —
+			// no other step can succeed with the same payload.
+			if classifyUpstreamFailure(resp, err) == nonRetryable && resp != nil {
+				log.Printf("fallback: openrouter models[] non-retryable status %d — surfacing to client, aborting chain", resp.StatusCode)
+				fc.ReliabilityTracker.Record("openrouter", false)
 				return resp, nil
 			}
 			log.Printf("fallback: openrouter models[] failed (%v) — continuing", err)
@@ -210,6 +223,20 @@ func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, e
 					log.Printf("fallback: %s model %s not found — cooldown 5min", r.ProviderID, r.ModelID)
 				}
 			}
+			// Non-retryable upstream error: the request itself was
+			// rejected. Walking more providers cannot fix it and would
+			// mask the real error behind the exhaustion response, so
+			// abort the chain and surface the upstream response as-is.
+			// (Per-status cooldowns above still apply so future requests
+			// avoid a misconfigured provider.)
+			if classifyUpstreamFailure(resp, err) == nonRetryable {
+				if resp != nil {
+					log.Printf("fallback: %s/%s non-retryable status %d — surfacing to client, aborting chain", r.ProviderID, r.ModelID, resp.StatusCode)
+					fc.ReliabilityTracker.Record(r.ProviderID, false)
+					return resp, nil
+				}
+				return nil, err // context canceled — client is gone
+			}
 			statusCode := 0
 			if resp != nil {
 				statusCode = resp.StatusCode
@@ -250,6 +277,12 @@ func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, e
 			return resp, nil
 		}
 		fc.ReliabilityTracker.Record("openrouter", false)
+		// A non-retryable error from the last step still surfaces the real
+		// upstream response instead of degrading into the exhaustion path.
+		if classifyUpstreamFailure(resp, err) == nonRetryable && resp != nil {
+			log.Printf("fallback: openrouter/free non-retryable status %d — surfacing to client", resp.StatusCode)
+			return resp, nil
+		}
 	}
 
 	return nil, fmt.Errorf("all providers exhausted after %d attempts", attempt)
