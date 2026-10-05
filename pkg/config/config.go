@@ -96,6 +96,17 @@ type ModelsConfig struct {
 
 	// Canonicalization tunes automatic alias derivation from the catalog.
 	Canonicalization CanonicalizationConfig `mapstructure:"canonicalization"`
+
+	// ExposeRaw controls whether raw upstream model IDs are advertised in
+	// GET /v1/models. Raw IDs always remain requestable and keep driving
+	// routing internally; this flag only filters the client-visible
+	// listing. Defaults to true (backward compatible).
+	ExposeRaw bool `mapstructure:"expose_raw"`
+
+	// ExposeCanonical controls whether canonical alias names are advertised
+	// in GET /v1/models. Requires models.canonicalization.enabled to take
+	// effect. Defaults to true.
+	ExposeCanonical bool `mapstructure:"expose_canonical"`
 }
 
 // CanonicalizationConfig controls auto-derivation of canonical model groups.
@@ -252,6 +263,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("fallback.max_attempts", 5)
 	v.SetDefault("models.canonicalization.enabled", true)
 	v.SetDefault("models.canonicalization.free_only", true)
+	v.SetDefault("models.expose_raw", true)
+	v.SetDefault("models.expose_canonical", true)
 	v.SetDefault("fallback.cerebras_request_spacing_ms", 100)
 	v.SetDefault("refresh.schedule", "weekly")
 	v.SetDefault("refresh.output_merge", "conservative")

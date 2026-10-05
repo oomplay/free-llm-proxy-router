@@ -95,3 +95,93 @@ func TestHandleModelsWithoutAliases(t *testing.T) {
 		t.Fatalf("data = %+v, want only the raw model", body.Data)
 	}
 }
+
+// newExposureServer builds a Server with one free upstream entry and its
+// canonical group, with the given exposure flags.
+func newExposureServer(exposeRaw, exposeCanonical bool) *Server {
+	cfg := &config.Config{}
+	cfg.Models.Canonicalization.Enabled = true
+	cfg.Models.ExposeRaw = exposeRaw
+	cfg.Models.ExposeCanonical = exposeCanonical
+	cat := &catalog.Catalog{Entries: []catalog.CatalogEntry{
+		{ProviderID: "huggingface", ModelID: "Qwen/Qwen3-32B", IsFree: true},
+	}}
+	return NewServer(cfg, cat, nil, nil, nil, nil)
+}
+
+func handleModelsIDs(s *Server) (map[string]bool, int) {
+	rec := httptest.NewRecorder()
+	s.handleModels(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	ids := map[string]bool{}
+	for _, m := range body.Data {
+		ids[m.ID] = true
+	}
+	return ids, len(body.Data)
+}
+
+// TestHandleModelsExposureCanonicalOnly verifies expose_raw: false +
+// expose_canonical: true advertises canonical alias names only, while the
+// raw registry stays intact internally (the raw ID is still reserved and
+// requestable).
+func TestHandleModelsExposureCanonicalOnly(t *testing.T) {
+	s := newExposureServer(false, true)
+	ids, n := handleModelsIDs(s)
+	if !ids["qwen3"] {
+		t.Errorf("canonical alias %q missing from /v1/models; got %v", "qwen3", ids)
+	}
+	if ids["Qwen/Qwen3-32B"] {
+		t.Errorf("raw model %q must not be listed when expose_raw is false", "Qwen/Qwen3-32B")
+	}
+	if n != 1 {
+		t.Errorf("listing has %d entries, want exactly the canonical name", n)
+	}
+}
+
+// TestHandleModelsExposureRawOnly verifies expose_raw: true +
+// expose_canonical: false advertises raw upstream IDs only.
+func TestHandleModelsExposureRawOnly(t *testing.T) {
+	s := newExposureServer(true, false)
+	ids, n := handleModelsIDs(s)
+	if !ids["Qwen/Qwen3-32B"] {
+		t.Errorf("raw model %q missing from /v1/models; got %v", "Qwen/Qwen3-32B", ids)
+	}
+	if ids["qwen3"] {
+		t.Errorf("canonical alias %q must not be listed when expose_canonical is false", "qwen3")
+	}
+	if n != 1 {
+		t.Errorf("listing has %d entries, want exactly the raw model", n)
+	}
+}
+
+// TestHandleModelsExposureBoth verifies the explicit both-true configuration
+// advertises raw IDs and canonical names.
+func TestHandleModelsExposureBoth(t *testing.T) {
+	s := newExposureServer(true, true)
+	ids, n := handleModelsIDs(s)
+	if !ids["Qwen/Qwen3-32B"] || !ids["qwen3"] {
+		t.Errorf("expected both raw and canonical entries; got %v", ids)
+	}
+	if n != 2 {
+		t.Errorf("listing has %d entries, want 2", n)
+	}
+}
+
+// TestHandleModelsExposureNoneFallsBackToBoth verifies the misconfiguration
+// guard: disabling both flags falls back to exposing both so a bad edit can
+// never leave clients with an empty discovery list.
+func TestHandleModelsExposureNoneFallsBackToBoth(t *testing.T) {
+	s := newExposureServer(false, false)
+	ids, n := handleModelsIDs(s)
+	if !ids["Qwen/Qwen3-32B"] || !ids["qwen3"] {
+		t.Errorf("both-false must fall back to exposing both; got %v", ids)
+	}
+	if n != 2 {
+		t.Errorf("listing has %d entries, want 2", n)
+	}
+}

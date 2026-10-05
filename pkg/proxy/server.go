@@ -498,38 +498,51 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 	w.Write(resp.Body)
 }
 
-// handleModels returns the list of available free models. Canonical alias
-// names are advertised after the raw upstream IDs so OpenAI-compatible
-// clients can discover and request them like any other model.
+// handleModels returns the list of available free models. Client-visible
+// exposure is configurable via models.expose_raw and models.expose_canonical
+// (both default true — the previous behaviour of advertising raw IDs
+// followed by canonical alias names). Disabling both is treated as a
+// misconfiguration and falls back to exposing both. Raw IDs remain
+// requestable and routable regardless of these flags — they only filter the
+// listing.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.Load()
 	cat := s.catalog.Load()
 	type modelEntry struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
 		Created int64  `json:"created"`
 	}
+	exposeRaw, exposeCanonical := cfg.Models.ExposeRaw, cfg.Models.ExposeCanonical
+	if !exposeRaw && !exposeCanonical {
+		exposeRaw, exposeCanonical = true, true
+	}
 	var models []modelEntry
 	listed := map[string]bool{}
-	for _, e := range cat.FreeEntries() {
-		listed[strings.ToLower(e.ModelID)] = true
-		models = append(models, modelEntry{
-			ID:     e.ModelID,
-			Object: "model",
-		})
+	if exposeRaw {
+		for _, e := range cat.FreeEntries() {
+			listed[strings.ToLower(e.ModelID)] = true
+			models = append(models, modelEntry{
+				ID:     e.ModelID,
+				Object: "model",
+			})
+		}
 	}
 	// Canonical names come from the live resolver. Raw model IDs are
 	// reserved by the alias layer, so a name collision cannot happen; the
 	// listed check is belt-and-braces.
-	if res := s.aliasRes.Load(); res != nil {
-		for _, name := range res.Names() {
-			if listed[name] {
-				continue
+	if exposeCanonical {
+		if res := s.aliasRes.Load(); res != nil {
+			for _, name := range res.Names() {
+				if listed[name] {
+					continue
+				}
+				listed[name] = true
+				models = append(models, modelEntry{
+					ID:     name,
+					Object: "model",
+				})
 			}
-			listed[name] = true
-			models = append(models, modelEntry{
-				ID:     name,
-				Object: "model",
-			})
 		}
 	}
 	resp := map[string]any{

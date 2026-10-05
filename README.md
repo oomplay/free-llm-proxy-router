@@ -148,8 +148,8 @@ A canonical name (e.g. `qwen3`) can map to one or more raw upstream model IDs.
 A request for the canonical name tries the mapped upstreams in order and uses
 the first free success; the response body is returned verbatim and the
 `X-Used-Model` header reports the canonical name. Raw model IDs keep working
-unchanged. Canonical names are also advertised in `GET /v1/models` alongside
-the raw IDs, so clients can discover them like any other model.
+unchanged. Canonical names are also advertised in `GET /v1/models` so clients
+can discover them like any other model.
 
 ```yaml
 models:
@@ -161,7 +161,41 @@ models:
   canonicalization:
     enabled: true    # Auto-derive groups from the catalog by model family
     free_only: true  # Only map free upstream models
+  # What GET /v1/models advertises to clients:
+  #   expose_raw       — raw upstream IDs ("Qwen/Qwen3-32B", …)
+  #   expose_canonical — canonical alias names ("qwen3", …)
+  # Defaults: both true (backward compatible). Set expose_raw: false to
+  # advertise canonical names only. Raw IDs stay requestable and keep
+  # driving routing/debugging internally either way — these flags only
+  # filter the /v1/models listing. Disabling both is treated as a
+  # misconfiguration and both are listed.
+  expose_raw: true
+  expose_canonical: true
 ```
+
+### Error classification
+
+Failures during candidate routing are classified once, and the class decides
+between "try the next candidate" and "return immediately":
+
+- **Retryable** — `408`, `429`, all `5xx`, upstream timeouts, and connection
+  failures: the walk continues to the next candidate (per-status cooldowns
+  still apply). Only when every candidate fails with a retryable failure does
+  the request get the short exhaustion response.
+- **Non-retryable** — `400`, `401`, `403`, and every other `4xx` except
+  `404`/`408`/`429`: the upstream response is returned to the client
+  verbatim. No further candidates are walked and a client error is never
+  masked behind a fake successful response.
+
+`404` is deliberately treated as retryable: during a candidate walk it means
+"this provider does not serve this model" (catalog staleness), so other
+candidates are tried and the entry is flagged for reverification. A `404`
+caused by request semantics — a model that is neither in the catalog nor a
+canonical alias — is answered immediately by the proxy itself, before any
+upstream call. Note that upstream `401`/`403` stem from the proxy's own
+provider credentials; they are surfaced instead of silently retried so a
+misconfiguration is visible, and the provider is put on a 10-minute cooldown
+either way.
 
 ## Catalog management
 
@@ -189,6 +223,18 @@ Keys are loaded from (first match wins):
 3. `~/.free-llm-proxy-router/.secrets`
 
 The `.env` file is gitignored. See `.env.example` for all supported keys.
+
+## Known limitations
+
+- **Streaming (`stream: true`) is not proxied as SSE.** The proxy always
+  requests non-streaming responses from providers and returns complete JSON:
+  `stream` is stripped from upstream request bodies (`buildBody`) so the
+  fallback chain can buffer responses, and `StreamProxy.Forward` — the SSE
+  pass-through helper — is currently never invoked. Clients therefore receive
+  HTTP 200 with the complete completion body instead of an SSE event stream,
+  regardless of the `stream` flag. This is a pre-existing, proxy-wide design
+  limitation (it affects raw-model requests and canonical-alias requests
+  alike), not part of the canonical alias feature.
 
 ## Development
 

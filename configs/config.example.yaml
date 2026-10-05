@@ -249,3 +249,17 @@ models:
     # (every free qwen* entry joins the "qwen3" group, etc.).
     enabled: true
     free_only: true
+  # What GET /v1/models advertises to clients.
+  #
+  #   expose_raw       — list raw upstream model IDs (e.g. "Qwen/Qwen3-32B")
+  #   expose_canonical — list canonical alias names (e.g. "qwen3")
+  #
+  # Defaults: both true (backward compatible). Common setups:
+  #   canonical only → expose_raw: false, expose_canonical: true
+  #   raw only       → expose_raw: true,  expose_canonical: false
+  #
+  # Raw IDs remain requestable and keep driving routing/debugging internally
+  # regardless of these flags; they only filter the /v1/models listing.
+  # Disabling both is treated as a misconfiguration and both are listed.
+  expose_raw: true
+  expose_canonical: true
