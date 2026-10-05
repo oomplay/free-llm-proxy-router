@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -83,14 +84,21 @@ func (s *Server) UpdateCatalog(cat *catalog.Catalog) {
 }
 
 // buildAliasResolver constructs the canonical model alias resolver from the
-// current config and catalog. It returns nil when the alias layer is
-// disabled; callers treat a nil resolver as "no canonical aliasing".
+// current config and catalog. It returns nil when neither canonicalization
+// nor a public pool alias is configured; callers treat a nil resolver as
+// "no canonical aliasing".
 //
 // Raw model IDs are reserved: a canonical name that exactly matches a raw
 // upstream ID is skipped, so the alias layer never shadows a model that
-// clients already request directly.
+// clients already request directly. The same rule applies to the public
+// pool alias (models.public_alias) — a collision there disables the pool
+// rather than shadowing the raw model.
 func buildAliasResolver(cfg *config.Config, cat *catalog.Catalog) *alias.Resolver {
-	if cfg == nil || !cfg.Models.Canonicalization.Enabled {
+	if cfg == nil {
+		return nil
+	}
+	pool := strings.ToLower(strings.TrimSpace(cfg.Models.PublicAlias))
+	if !cfg.Models.Canonicalization.Enabled && pool == "" {
 		return nil
 	}
 	var entries []catalog.CatalogEntry
@@ -101,10 +109,19 @@ func buildAliasResolver(cfg *config.Config, cat *catalog.Catalog) *alias.Resolve
 			reserved[strings.ToLower(e.ModelID)] = true
 		}
 	}
-	return alias.NewResolver(entries, cfg.Models.Aliases, alias.Options{
-		FreeOnly: cfg.Models.Canonicalization.FreeOnly,
-		Reserved: reserved,
-	})
+	opts := alias.Options{
+		FreeOnly:          cfg.Models.Canonicalization.FreeOnly,
+		Reserved:          reserved,
+		DisableAutoGroups: !cfg.Models.Canonicalization.Enabled,
+	}
+	if pool != "" {
+		if reserved[pool] {
+			log.Printf("config: models.public_alias %q collides with a raw model ID — pool alias disabled", cfg.Models.PublicAlias)
+		} else {
+			opts.PoolAlias = pool
+		}
+	}
+	return alias.NewResolver(entries, cfg.Models.Aliases, opts)
 }
 
 // upstreamHTTPClient returns the HTTP client used for upstream calls from
@@ -126,6 +143,10 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/completions", s.handleCompletions)
+	// Operator visibility into the public pool alias (models.public_alias):
+	// which provider/model pairs currently back it. Model identities only —
+	// no credentials. Protected by the auth middleware when configured.
+	mux.HandleFunc("/debug/pool", s.handleDebugPool)
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -363,7 +384,12 @@ func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *co
 	if len(ups) == 0 {
 		return false
 	}
-	log.Printf("canonical alias: %q -> %d upstream candidate(s)", req.Model, len(ups))
+	if resolver.IsPool(req.Model) {
+		log.Printf("pool alias: %q -> %d free candidate(s)", req.Model, len(ups))
+		ups = s.rankPoolCandidates(cfg, req, resolver, cat, req.Model, ups)
+	} else {
+		log.Printf("canonical alias: %q -> %d upstream candidate(s)", req.Model, len(ups))
+	}
 
 	chain := &FallbackChain{
 		Cfg:                cfg,
@@ -446,6 +472,84 @@ func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *co
 	return true
 }
 
+// rankPoolCandidates orders the global free-pool alias candidates with the
+// existing routing strategy machinery instead of raw catalog order — the
+// pool must respect the same health/reliability/latency preferences as the
+// strategy chain. No new routing engine is invented: the configured strategy
+// (proxy.strategy) ranks the pool entries, and the walk order is the only
+// output. On top of the strategy ranking, candidates whose recorded context
+// window cannot hold the request (estimated prompt + requested completion)
+// are demoted behind fitting ones rather than dropped — context metadata may
+// be missing or stale, and the upstream still gets the final say. Retry,
+// cooldown, 429 handling, and fallback semantics are untouched.
+//
+// When no strategy registry is available (tests) or the strategy yields no
+// ranking, the original catalog order is kept.
+func (s *Server) rankPoolCandidates(cfg *config.Config, req Request, resolver *alias.Resolver, cat *catalog.Catalog, name string, ups []alias.Upstream) []alias.Upstream {
+	if len(ups) < 2 {
+		return ups
+	}
+
+	stratReq := strategy.Request{
+		Messages:              req.Messages,
+		EstimatedPromptTokens: estimateTokens(req.Messages),
+		MaxTokens:             req.MaxTokens,
+		Stream:                req.Stream,
+		Model:                 name,
+	}
+
+	rank := map[string]int{}
+	if s.strategyReg != nil {
+		stratName := cfg.Proxy.Strategy
+		if stratName == "" {
+			stratName = "adaptive"
+		}
+		if strat, err := s.strategyReg.Get(stratName); err == nil && strat != nil {
+			entries := resolver.Candidates(cat, name)
+			for i, r := range strat.Rank(stratReq, entries, nil) {
+				rank[r.ProviderID+"/"+r.ModelID] = i
+			}
+		}
+	}
+	if len(rank) == 0 {
+		return ups // no usable strategy — keep catalog order
+	}
+
+	// Context-fit demotion: needed tokens vs the candidate's recorded
+	// context window (only when the metadata carries one).
+	needed := stratReq.EstimatedPromptTokens
+	if req.MaxTokens > 0 {
+		needed += req.MaxTokens
+	}
+	type ordered struct {
+		up   alias.Upstream
+		rank int
+		fits bool
+	}
+	list := make([]ordered, 0, len(ups))
+	for i, u := range ups {
+		o := ordered{up: u, rank: len(ups) + i, fits: true} // unranked → last, stable
+		if r, ok := rank[u.Key()]; ok {
+			o.rank = r
+		}
+		if e := cat.Find(u.ProviderID, u.ModelID); e != nil && e.ContextWindow > 0 && needed > e.ContextWindow {
+			o.fits = false
+		}
+		list = append(list, o)
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].fits != list[j].fits {
+			return list[i].fits // fitting candidates first
+		}
+		return list[i].rank < list[j].rank
+	})
+	out := make([]alias.Upstream, 0, len(list))
+	for _, o := range list {
+		out = append(out, o.up)
+	}
+	return out
+}
+
 // matchEntry reports whether a catalog entry matches the requested model.
 // Pass 1: full exact string match (handles OpenRouter IDs with embedded slash).
 // Pass 2: explicit provider-prefix routing (e.g. "groq/llama-3.3-70b-versatile").
@@ -522,9 +626,10 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 // exposure is configurable via models.expose_raw and models.expose_canonical
 // (both default true — the previous behaviour of advertising raw IDs
 // followed by canonical alias names). Disabling both is treated as a
-// misconfiguration and falls back to exposing both. Raw IDs remain
-// requestable and routable regardless of these flags — they only filter the
-// listing.
+// misconfiguration and falls back to exposing both — unless a public pool
+// alias (models.public_alias) is configured, in which case the listing is
+// exactly that one model. Raw IDs remain requestable and routable
+// regardless of these flags — they only filter the listing.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
 	cat := s.catalog.Load()
@@ -532,6 +637,26 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
 		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by,omitempty"`
+	}
+	// Public pool alias mode: ONE client-visible model name representing
+	// the entire discovered free pool. Overrides the expose flags — raw
+	// IDs and canonical families stay requestable and routable (advanced/
+	// raw use), they just are not advertised.
+	if res := s.aliasRes.Load(); res != nil {
+		if pool := res.PoolAlias(); pool != "" {
+			resp := map[string]any{
+				"object": "list",
+				"data": []modelEntry{{
+					ID:      pool,
+					Object:  "model",
+					OwnedBy: "free-llm-proxy",
+				}},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
 	}
 	exposeRaw, exposeCanonical := cfg.Models.ExposeRaw, cfg.Models.ExposeCanonical
 	if !exposeRaw && !exposeCanonical {
@@ -568,6 +693,49 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"object": "list",
 		"data":   models,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleDebugPool exposes the real candidate pool behind the public alias
+// for operators. Clients see only the pool alias name; this endpoint shows
+// which provider/model pairs currently back it — provider IDs and model IDs
+// only, never credentials (auth middleware still applies when an auth token
+// is configured).
+func (s *Server) handleDebugPool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	res := s.aliasRes.Load()
+	cat := s.catalog.Load()
+	if res == nil || res.PoolAlias() == "" {
+		http.Error(w, `{"error":"no pool alias active (models.public_alias unset, reserved-name collision, or no eligible free candidates)"}`, http.StatusNotFound)
+		return
+	}
+	pool := res.PoolAlias()
+	ups := res.Upstreams(pool)
+	type candidate struct {
+		Provider      string `json:"provider"`
+		Model         string `json:"model"`
+		ContextWindow int    `json:"context_window,omitempty"`
+	}
+	list := make([]candidate, 0, len(ups))
+	for _, u := range ups {
+		c := candidate{Provider: u.ProviderID, Model: u.ModelID}
+		if e := cat.Find(u.ProviderID, u.ModelID); e != nil {
+			c.ContextWindow = e.ContextWindow
+		}
+		list = append(list, c)
+	}
+	resp := map[string]any{
+		"pool":       pool,
+		"candidates": len(list),
+		"upstreams":  list,
+	}
+	if cat != nil && !cat.UpdatedAt.IsZero() {
+		resp["catalog_updated_at"] = cat.UpdatedAt
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)

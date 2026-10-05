@@ -263,7 +263,33 @@ models:
     # (every free qwen* entry joins the "qwen3" group, etc.).
     enabled: true
     free_only: true
-  # What GET /v1/models advertises to clients.
+  # Single-model public mode — RECOMMENDED production setting.
+  #
+  # public_alias turns ONE model name into the entire pool of discovered
+  # free chat-capable models. The pool is rebuilt from the live catalog on
+  # every refresh, so models coming and going never require a client
+  # configuration change: the client always sends model: "kiwi-auto" and
+  # the proxy picks the best eligible free upstream using the configured
+  # routing strategy (health, cooldown, 429/retryable-5xx fallback and
+  # streaming semantics all apply).
+  #
+  # In this mode GET /v1/models advertises ONLY the pool alias, so an
+  # OpenAI-compatible client needs exactly:
+  #
+  #   Base URL: http://127.0.0.1:8080/v1
+  #   Model:    kiwi-auto
+  #
+  # Raw IDs and canonical family names stay requestable for advanced/raw
+  # use (e.g. "unorouter/qwen3:free", "qwen3") — they are simply not
+  # advertised. Inspect the live pool at GET /debug/pool.
+  #
+  # Comment public_alias out (and set expose_raw/expose_canonical) to return
+  # to the multi-model listing below.
+  public_alias: "kiwi-auto"
+  expose_raw: false
+  expose_canonical: false
+
+  # Multi-model mode (used when public_alias is unset):
   #
   #   expose_raw       — list raw upstream model IDs (e.g. "Qwen/Qwen3-32B")
   #   expose_canonical — list canonical alias names (e.g. "qwen3")
@@ -275,5 +301,6 @@ models:
   # Raw IDs remain requestable and keep driving routing/debugging internally
   # regardless of these flags; they only filter the /v1/models listing.
   # Disabling both is treated as a misconfiguration and both are listed.
-  expose_raw: true
-  expose_canonical: true
+  #
+  # expose_raw: true
+  # expose_canonical: true

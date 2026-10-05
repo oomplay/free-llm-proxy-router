@@ -42,6 +42,18 @@ type Options struct {
 	// FreeOnly restricts auto-grouping to entries flagged IsFree. Explicit
 	// config aliases always apply regardless of this flag.
 	FreeOnly bool
+	// DisableAutoGroups turns off canonical family auto-derivation while
+	// keeping config aliases and the pool alias active. Set when
+	// canonicalization is disabled but a public pool alias is configured.
+	DisableAutoGroups bool
+	// PoolAlias, when set, creates one synthetic group mapping that name to
+	// EVERY eligible free chat-capable catalog entry — the client-facing
+	// "whole free pool" model (e.g. "kiwi-auto"). The pool is always
+	// free-only and chat-capable regardless of FreeOnly/DisableAutoGroups,
+	// and replaces any same-named auto or config-override group. Skipped
+	// when the name is reserved (a raw model ID) or the catalog has no
+	// eligible entries.
+	PoolAlias string
 	// Reserved canonical names are skipped (exact raw model IDs that must
 	// not be shadowed by an alias). Keys are lowercase.
 	Reserved map[string]bool
@@ -54,6 +66,7 @@ type Resolver struct {
 	auto    map[string]bool
 	names   []string
 	byEntry map[Upstream]string // upstream -> canonical name
+	pool    string              // global free-pool alias ("" when unconfigured)
 }
 
 // NewResolver builds the resolver from catalog entries and config overrides.
@@ -68,21 +81,24 @@ func NewResolver(entries []catalog.CatalogEntry, overrides map[string][]string, 
 		byEntry: map[Upstream]string{},
 	}
 
-	// Auto-groups derived from the catalog.
-	seenAuto := map[Upstream]bool{}
-	for _, e := range entries {
-		if opts.FreeOnly && !e.IsFree {
-			continue
-		}
-		name := Canonicalize(e.ModelID)
-		if name == "" || opts.Reserved[name] {
-			continue
-		}
-		u := Upstream{ProviderID: e.ProviderID, ModelID: e.ModelID}
-		if !seenAuto[u] {
-			seenAuto[u] = true
-			r.byName[name] = append(r.byName[name], u)
-			r.auto[name] = true
+	// Auto-groups derived from the catalog. Disabled when the caller only
+	// wants explicit aliases and/or the pool alias (DisableAutoGroups).
+	if !opts.DisableAutoGroups {
+		seenAuto := map[Upstream]bool{}
+		for _, e := range entries {
+			if opts.FreeOnly && !e.IsFree {
+				continue
+			}
+			name := Canonicalize(e.ModelID)
+			if name == "" || opts.Reserved[name] {
+				continue
+			}
+			u := Upstream{ProviderID: e.ProviderID, ModelID: e.ModelID}
+			if !seenAuto[u] {
+				seenAuto[u] = true
+				r.byName[name] = append(r.byName[name], u)
+				r.auto[name] = true
+			}
 		}
 	}
 
@@ -109,6 +125,33 @@ func NewResolver(entries []catalog.CatalogEntry, overrides map[string][]string, 
 		if len(ups) > 0 {
 			r.byName[name] = ups
 			r.auto[name] = false
+		}
+	}
+
+	// Global free-pool alias: one public name over every eligible free
+	// chat-capable catalog entry. The pool is always free-only (paid models
+	// never enter, regardless of FreeOnly) and chat-capable (endpoint
+	// metadata wins, name patterns fall back) so a normal chat request is
+	// never routed to an embedding/image/speech model. It replaces any
+	// same-named auto or override group — the pool alias is the public
+	// abstraction sitting ABOVE the individual canonical families.
+	if pool := strings.ToLower(strings.TrimSpace(opts.PoolAlias)); pool != "" && !opts.Reserved[pool] {
+		var ups []Upstream
+		seenPool := map[Upstream]bool{}
+		for _, e := range entries {
+			if !e.IsFree || !PoolChatCapable(e) {
+				continue
+			}
+			u := Upstream{ProviderID: e.ProviderID, ModelID: e.ModelID}
+			if !seenPool[u] {
+				seenPool[u] = true
+				ups = append(ups, u)
+			}
+		}
+		if len(ups) > 0 {
+			r.byName[pool] = ups
+			delete(r.auto, pool)
+			r.pool = pool
 		}
 	}
 
@@ -283,6 +326,25 @@ func (r *Resolver) IsAuto(name string) bool {
 	return r.auto[strings.ToLower(name)]
 }
 
+// PoolAlias returns the configured global free-pool alias, or "" when the
+// resolver has no pool alias (unconfigured, reserved-name collision, or no
+// eligible free candidates in the catalog).
+func (r *Resolver) PoolAlias() string {
+	if r == nil {
+		return ""
+	}
+	return r.pool
+}
+
+// IsPool reports whether name is the global free-pool alias
+// (case-insensitive, trimmed).
+func (r *Resolver) IsPool(name string) bool {
+	if r == nil || r.pool == "" {
+		return false
+	}
+	return strings.ToLower(strings.TrimSpace(name)) == r.pool
+}
+
 // CanonicalName returns the canonical form of name if it is canonical, else "".
 func (r *Resolver) CanonicalName(name string) string {
 	if r == nil {
@@ -316,6 +378,72 @@ func (r *Resolver) Candidates(cat *catalog.Catalog, name string) []catalog.Catal
 		}
 	}
 	return out
+}
+
+// PoolChatCapable reports whether a catalog entry can serve OpenAI-compatible
+// /chat/completions requests — the eligibility filter for the global free
+// pool alias. Decisions come only from information the scanners already
+// recorded; nothing is invented:
+//
+//  1. supported_endpoint_types metadata wins when present — the list must
+//     mark a chat endpoint ("openai"/"chat"/"completions") and must not
+//     mark a non-chat one ("embedding", "image-generation", "tts", …);
+//  2. without endpoint metadata the model ID decides via the same
+//     conservative name patterns the scanners apply at discovery time.
+//
+// An entry with no metadata and a neutral name is assumed chat-capable:
+// the scanners only admit such models after their own chat-capability
+// checks, so the pool keeps them.
+func PoolChatCapable(e catalog.CatalogEntry) bool {
+	if types := endpointTypes(e.Metadata); len(types) > 0 {
+		chat := false
+		for _, t := range types {
+			switch strings.ToLower(strings.TrimSpace(t)) {
+			case "embedding", "embed", "rerank", "image", "image-generation",
+				"audio", "speech", "tts", "stt", "asr", "aihorde", "midjourney":
+				return false // explicitly non-chat endpoint
+			case "openai", "chat", "completions", "chat/completions":
+				chat = true
+			}
+		}
+		return chat // endpoint list present but marks no chat endpoint → out
+	}
+	return chatCapableByName(e.ModelID)
+}
+
+// endpointTypes extracts the supported_endpoint_types list from entry
+// metadata. JSON decoding produces []any; programmatic metadata may hold
+// []string — both are accepted.
+func endpointTypes(meta map[string]any) []string {
+	if meta == nil {
+		return nil
+	}
+	switch v := meta["supported_endpoint_types"].(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// chatCapableByName applies the scanner name filter (the pkg/scan
+// isEligibleModel patterns) to entries without endpoint metadata.
+func chatCapableByName(modelID string) bool {
+	lower := strings.ToLower(modelID)
+	for _, skip := range []string{"embed", "rerank", "image", "vision-only", "tts", "stt", "whisper"} {
+		if strings.Contains(lower, skip) {
+			return false
+		}
+	}
+	return true
 }
 
 // RawRef is a raw escape hatch parsed from a request model field.

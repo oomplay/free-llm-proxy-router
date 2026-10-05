@@ -126,3 +126,28 @@ func TestAPIKeyEnvRefExpansion(t *testing.T) {
 		t.Errorf("unknown env ref = %q, want empty", got)
 	}
 }
+// TestPublicAliasParsing verifies models.public_alias is loaded and defaults
+// to empty (feature off) when unset.
+func TestPublicAliasParsing(t *testing.T) {
+	path := writeTempConfig(t, "models:\n  public_alias: \"kiwi-auto\"\n  expose_raw: false\n  expose_canonical: false\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Models.PublicAlias != "kiwi-auto" {
+		t.Errorf("public_alias = %q, want kiwi-auto", cfg.Models.PublicAlias)
+	}
+	if cfg.Models.ExposeRaw || cfg.Models.ExposeCanonical {
+		t.Errorf("exposure flags = %v/%v, want false/false", cfg.Models.ExposeRaw, cfg.Models.ExposeCanonical)
+	}
+
+	// Default: unset.
+	defPath := writeTempConfig(t, "proxy:\n  port: 9999\n")
+	defCfg, err := Load(defPath)
+	if err != nil {
+		t.Fatalf("Load default: %v", err)
+	}
+	if defCfg.Models.PublicAlias != "" {
+		t.Errorf("public_alias default = %q, want empty", defCfg.Models.PublicAlias)
+	}
+}

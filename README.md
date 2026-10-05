@@ -212,6 +212,50 @@ models:
   expose_canonical: true
 ```
 
+### Single-model public mode (`kiwi-auto`)
+
+For production deployments where clients should never care which free model
+serves them, `models.public_alias` turns ONE model name into the entire pool
+of discovered free chat-capable models:
+
+```yaml
+models:
+  public_alias: "kiwi-auto"   # one name for the whole free pool
+  expose_raw: false
+  expose_canonical: false
+```
+
+With this configuration `GET /v1/models` advertises exactly one entry —
+`kiwi-auto` — and every chat request naming `kiwi-auto` is routed to the best
+candidate among **all** currently discovered free chat-capable models
+(`qwen3:free`, `deepseek-v3:free`, `gemma3:free`, …). Semantics:
+
+- **Dynamic** — the pool is rebuilt from the live catalog on every catalog
+  refresh; models appearing or disappearing never require a client change.
+  The client always sends `model: "kiwi-auto"`.
+- **Free-only and chat-capable** — paid models never enter the pool, and
+  non-chat models (embedding/image/speech, by endpoint metadata or name
+  pattern) are excluded. Eligibility stays with the existing discovery
+  layer (`:free` markers / pricing metadata / endpoint types).
+- **Existing routing machinery** — pool candidates are ranked by the
+  configured strategy (`proxy.strategy`, default `adaptive`), and candidates
+  whose recorded context window cannot hold the request are demoted behind
+  fitting ones. Health, cooldown, 429 handling, retryable-5xx fallback, and
+  timeouts behave exactly as on the canonical-alias route.
+- **Streaming** — `model: "kiwi-auto", stream: true` uses the real SSE
+  pass-through: one upstream candidate is selected, its event stream is
+  pumped byte-for-byte, and fallback between candidates happens only before
+  the first downstream byte.
+- **Debug headers** — `X-Used-Model: kiwi-auto` while
+  `X-Free-Router-Upstream-Provider` / `X-Free-Router-Upstream-Model` reveal
+  the actual upstream that served the request.
+- **Raw compatibility** — raw IDs (`unorouter/qwen3:free`) and canonical
+  family names (`qwen3`) remain requestable for advanced/raw use but are not
+  advertised in `/v1/models` in this mode.
+- **Operator visibility** — `GET /debug/pool` reports the live candidate set
+  behind the alias (provider, model, context window) without exposing
+  credentials.
+
 ### Error classification
 
 Failures during candidate routing are classified once, and the class decides

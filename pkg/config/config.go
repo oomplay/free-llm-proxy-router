@@ -107,6 +107,17 @@ type ModelsConfig struct {
 	// in GET /v1/models. Requires models.canonicalization.enabled to take
 	// effect. Defaults to true.
 	ExposeCanonical bool `mapstructure:"expose_canonical"`
+
+	// PublicAlias, when set, turns ONE model name into the entire pool of
+	// discovered free chat-capable models (e.g. "kiwi-auto"). The pool is
+	// rebuilt from the live catalog on every refresh, so candidates come and
+	// go without any client configuration change. In this single-model mode
+	// GET /v1/models advertises ONLY this name — expose_raw/expose_canonical
+	// apply to non-pool configurations. Raw IDs ("provider/model:free") and
+	// canonical family names stay requestable and routable for advanced/raw
+	// use; they are just not listed. The real candidate set behind the alias
+	// is inspectable at GET /debug/pool.
+	PublicAlias string `mapstructure:"public_alias"`
 }
 
 // CanonicalizationConfig controls auto-derivation of canonical model groups.
@@ -275,6 +286,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("models.canonicalization.free_only", true)
 	v.SetDefault("models.expose_raw", true)
 	v.SetDefault("models.expose_canonical", true)
+	v.SetDefault("models.public_alias", "")
 	v.SetDefault("fallback.cerebras_request_spacing_ms", 100)
 	v.SetDefault("refresh.schedule", "weekly")
 	v.SetDefault("refresh.output_merge", "conservative")
