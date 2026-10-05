@@ -1,6 +1,6 @@
 # free-llm-proxy-router
 
-An OpenAI-compatible local proxy that routes LLM requests across free-tier providers — Groq, Gemini, OpenRouter, GitHub Models, Cerebras, Mistral, HuggingFace and more — with automatic fallback, rate-limit recovery, and 13 routing strategies.
+An OpenAI-compatible local proxy that routes LLM requests across free-tier providers — Groq, Gemini, OpenRouter, UnoRouter, GitHub Models, Cerebras, Mistral, HuggingFace and more — with automatic fallback, rate-limit recovery, and 13 routing strategies.
 
 ## What it does
 
@@ -120,7 +120,46 @@ All providers have recharging free limits — no one-time trial credits, no cred
 | **Mistral AI** | 2 RPM | per minute |
 | **Cohere** | 1000 req/month | monthly |
 | **NVIDIA NIM** | Free credits, 40 RPM, 200+ models | monthly |
+| **UnoRouter** | Free models only (IDs with `:free` suffix, e.g. `qwen/qwen3-235b-a22b:free`) | always free |
 | **Ollama** | Unlimited | local, no key |
+
+### UnoRouter (generic OpenAI-compatible upstream)
+
+UnoRouter is an independent OpenAI-compatible aggregator — **not** OpenRouter.
+It is supported as its own upstream provider through the standard
+OpenAI-compatible wire format:
+
+- **Base URL** — `https://api.unorouter.com/v1` (config key `unorouter`)
+- **Auth** — `Authorization: Bearer $UNOROUTER_API_KEY`; the key comes from
+  the environment (`api_key_env: UNOROUTER_API_KEY`), never hardcoded. The
+  literal form `api_key: "${UNOROUTER_API_KEY}"` also works — `${VAR}`
+  references in `api_key` are expanded from the environment at load time.
+- **Discovery** — `GET /v1/models` (OpenAI-compatible listing; availability
+  depends on the API key). Results are plain catalog entries, so they flow
+  through the same canonicalization, routing, health, and fallback machinery
+  as every other provider — no separate model registry.
+- **Free detection** — pricing metadata is preferred when the API exposes it
+  (zero prompt+completion / input+output prices, or an explicit free flag);
+  otherwise the documented `:free` ID suffix decides (`discovery.free_markers`,
+  default `[":free"]`). Models with neither signal are treated as paid and
+  excluded — not every UnoRouter model is free.
+- **Canonical aliases** — UnoRouter free IDs canonicalize like any other
+  provider (`qwen/qwen3-235b-a22b:free` and `qwen/qwen3-30b-a3b:free` join
+  the `qwen3` group), so clients request `qwen3` while the upstream receives
+  the exact raw `:free` ID. Multiple free candidates for one canonical name
+  walk the existing retryable-failure fallback chain.
+- **Standalone** — UnoRouter works as the only enabled upstream when just
+  `UNOROUTER_API_KEY` is configured.
+
+The provider list may also be spelled `upstreams:` in the config file
+(`providers:` wins when both keys are present):
+
+```yaml
+upstreams:
+  - id: unorouter
+    base_url: https://api.unorouter.com/v1
+    api_key: ${UNOROUTER_API_KEY}
+```
 
 ## Configuration
 

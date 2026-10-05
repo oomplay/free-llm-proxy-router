@@ -170,3 +170,24 @@ func TestParseRawModel(t *testing.T) {
 		}
 	}
 }
+
+// TestCanonicalizeUnoRouterIDs checks UnoRouter free-tier IDs canonicalize
+// through the same shared family layer as the other providers — vendor
+// namespaces and the ":free" suffix are stripped, paid-suffix-free families
+// keep their identity.
+func TestCanonicalizeUnoRouterIDs(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"qwen/qwen3-235b-a22b:free", "qwen3"},
+		{"qwen/qwen3-30b-a3b:free", "qwen3"},
+		{"space-bunny-alpha:free", "space-bunny-alpha"},
+		{"k2-horizon:free", "k2-horizon"},
+		{"deepseek/deepseek-r1:free", "deepseek-r1"},
+		{"mimo-v2.6-pro:free", "mimo-v2.6-pro"},
+		{"glm-5.3-flash:free", "glm5.3-flash"},
+	}
+	for _, c := range cases {
+		if got := Canonicalize(c.in); got != c.want {
+			t.Errorf("Canonicalize(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

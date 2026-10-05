@@ -73,6 +73,8 @@ func (d *Dispatcher) scannerFor(providerID string) ProviderScanner {
 		return &HuggingFaceScanner{Client: d.client}
 	case "github-models":
 		return &GitHubScanner{Client: d.client}
+	case "unorouter":
+		return &UnorouterScanner{Client: d.client}
 	default:
 		return &GenericScanner{Client: d.client}
 	}

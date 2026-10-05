@@ -189,6 +189,20 @@ providers:
       models_endpoint: "https://models.github.ai/catalog/models"
       all_free: true
 
+  - id: unorouter
+    name: "UnoRouter"
+    base_url: "https://api.unorouter.com/v1"
+    api_key_env: "UNOROUTER_API_KEY"   # or: api_key: "${UNOROUTER_API_KEY}"
+    enabled: false
+    priority: 7
+    timeout: "30s"
+    rate_limit_notes: "Independent OpenAI-compatible aggregator — NOT OpenRouter. Free models carry a ':free' ID suffix; model availability depends on the API key."
+    discovery:
+      # Free-tier detection: pricing metadata wins when the API exposes it;
+      # otherwise this ID-suffix marker decides. Models without either are
+      # treated as paid and excluded from the catalog.
+      free_markers: [":free"]
+
   - id: nvidia-nim
     name: "NVIDIA NIM"
     base_url: "https://integrate.api.nvidia.com/v1"

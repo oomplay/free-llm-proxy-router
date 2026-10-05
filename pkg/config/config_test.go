@@ -62,3 +62,67 @@ func TestModelsExposureParsingRawOnly(t *testing.T) {
 		t.Errorf("expose_canonical = true, want false")
 	}
 }
+
+// TestUpstreamsSynonym verifies the provider list may be spelled
+// "upstreams" in the config file (the shape used in the UnoRouter docs):
+//
+//	upstreams:
+//	  - id: unorouter
+//	    base_url: https://api.unorouter.com/v1
+//	    api_key: ${UNOROUTER_API_KEY}
+func TestUpstreamsSynonym(t *testing.T) {
+	path := writeTempConfig(t, "upstreams:\n  - id: unorouter\n    base_url: https://api.unorouter.com/v1\n    api_key_env: UNOROUTER_API_KEY\n    enabled: true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Providers) != 1 {
+		t.Fatalf("providers = %+v, want exactly the one unorouter upstream", cfg.Providers)
+	}
+	p := cfg.Providers[0]
+	if p.ID != "unorouter" || p.BaseURL != "https://api.unorouter.com/v1" || !p.Enabled {
+		t.Errorf("provider = %+v, want id=unorouter base_url=https://api.unorouter.com/v1 enabled=true", p)
+	}
+}
+
+// TestUpstreamsProvidersWinsWhenBoth: when both spellings appear, the
+// canonical "providers" key wins.
+func TestUpstreamsProvidersWinsWhenBoth(t *testing.T) {
+	path := writeTempConfig(t, "providers:\n  - id: groq\n    base_url: https://api.groq.com/openai/v1\n    enabled: true\nupstreams:\n  - id: unorouter\n    base_url: https://api.unorouter.com/v1\n    enabled: true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "groq" {
+		t.Errorf("providers = %+v, want the providers-key entry to win", cfg.Providers)
+	}
+}
+
+// TestAPIKeyEnvRefExpansion verifies api_key: "${VAR}" resolves from the
+// environment (real env first, then dotenv) — the key itself is never
+// hardcoded in the config.
+func TestAPIKeyEnvRefExpansion(t *testing.T) {
+	t.Setenv("UNOROUTER_API_KEY", "expanded-test-key")
+	path := writeTempConfig(t, "providers:\n  - id: unorouter\n    base_url: https://api.unorouter.com/v1\n    api_key: \"${UNOROUTER_API_KEY}\"\n    enabled: true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	p := cfg.Providers[0]
+	if got := p.ResolvedAPIKey(); got != "expanded-test-key" {
+		t.Errorf("ResolvedAPIKey = %q, want expanded-test-key", got)
+	}
+	header, value := p.ResolvedAuth()
+	if header != "Authorization" || value != "Bearer expanded-test-key" {
+		t.Errorf("ResolvedAuth = (%q, %q), want (Authorization, Bearer expanded-test-key)", header, value)
+	}
+	// Keys pooled via numbered env variants still resolve.
+	if keys := p.AllKeys(); len(keys) != 1 || keys[0] != "expanded-test-key" {
+		t.Errorf("AllKeys = %v, want [expanded-test-key]", keys)
+	}
+	// An unknown reference expands to empty — no literal "${VAR}" leaks.
+	p.APIKey = "${DEFINITELY_NOT_SET_ANYWHERE_XYZ}"
+	if got := p.ResolvedAPIKey(); got != "" {
+		t.Errorf("unknown env ref = %q, want empty", got)
+	}
+}

@@ -182,6 +182,16 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("unmarshalling config: %w", err)
 	}
 
+	// "upstreams" is accepted as a synonym for "providers" — the provider
+	// list is the proxy's upstream table and both spellings appear in
+	// examples. "providers" wins when both keys are present.
+	if len(cfg.Providers) == 0 {
+		var upstreams []ProviderConfig
+		if err := v.UnmarshalKey("upstreams", &upstreams); err == nil && len(upstreams) > 0 {
+			cfg.Providers = upstreams
+		}
+	}
+
 	mu.Lock()
 	current = &cfg
 	mu.Unlock()

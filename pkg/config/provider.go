@@ -1,6 +1,30 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// envRefPattern matches "${VAR}" references in literal config values so an
+// API key can be sourced from the environment without hardcoding it:
+//
+//	api_key: "${UNOROUTER_API_KEY}"
+var envRefPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandEnvRefs replaces every "${NAME}" in s with the value of NAME,
+// checking real environment variables first, then dotenv files (same lookup
+// order as api_key_env). Unknown references expand to the empty string: a
+// missing key yields "no auth header" rather than a literal "${NAME}"
+// being sent upstream.
+func expandEnvRefs(s string) string {
+	if s == "" || !strings.Contains(s, "${") {
+		return s
+	}
+	return envRefPattern.ReplaceAllStringFunc(s, func(ref string) string {
+		return lookupEnv(ref[2 : len(ref)-1])
+	})
+}
 
 // ProviderConfig holds all configuration for a single provider.
 type ProviderConfig struct {
@@ -78,20 +102,22 @@ type DiscoveryConfig struct {
 
 // ResolvedAPIKey returns the bare API key (no header name, no prefix).
 // Useful for providers that pass the key as a query parameter (e.g. Gemini).
-// Lookup order: real env var → dotenv file → literal api_key field.
+// Lookup order: real env var → dotenv file → literal api_key field (with
+// "${VAR}" references expanded).
 func (p *ProviderConfig) ResolvedAPIKey() string {
 	if p.APIKeyEnv != "" {
 		if v := lookupEnv(p.APIKeyEnv); v != "" {
 			return v
 		}
 	}
-	return p.APIKey
+	return expandEnvRefs(p.APIKey)
 }
 
 // ResolvedAuth returns the effective API key and auth header values.
-// The env var takes precedence over the literal key.
+// The env var takes precedence over the literal key (whose "${VAR}"
+// references, if any, are expanded).
 func (p *ProviderConfig) ResolvedAuth() (header, value string) {
-	key := p.APIKey
+	key := expandEnvRefs(p.APIKey)
 	if p.APIKeyEnv != "" {
 		if v := lookupEnv(p.APIKeyEnv); v != "" {
 			key = v
@@ -117,8 +143,8 @@ func (p *ProviderConfig) ResolvedAuth() (header, value string) {
 // The proxy rotates to the next slot automatically on 429.
 func (p *ProviderConfig) AllKeys() []string {
 	var keys []string
-	if p.APIKey != "" {
-		keys = append(keys, p.APIKey)
+	if key := expandEnvRefs(p.APIKey); key != "" {
+		keys = append(keys, key)
 	}
 	if p.APIKeyEnv != "" {
 		if v := lookupEnv(p.APIKeyEnv); v != "" {
