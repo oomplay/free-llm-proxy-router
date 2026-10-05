@@ -56,13 +56,14 @@ type unoPricing struct {
 // ID are optional — the endpoint is OpenAI-compatible but the exact
 // metadata returned depends on the API key.
 type unoModel struct {
-	ID            string      `json:"id"`
-	Object        string      `json:"object"`
-	Created       int64       `json:"created"`
-	OwnedBy       string      `json:"owned_by"`
-	ContextLength int         `json:"context_length"`
-	Pricing       *unoPricing `json:"pricing"`
-	IsFree        *bool       `json:"is_free"`
+	ID                    string      `json:"id"`
+	Object                string      `json:"object"`
+	Created               int64       `json:"created"`
+	OwnedBy               string      `json:"owned_by"`
+	ContextLength         int         `json:"context_length"`
+	SupportedEndpointTypes []string   `json:"supported_endpoint_types"`
+	Pricing               *unoPricing `json:"pricing"`
+	IsFree                *bool       `json:"is_free"`
 }
 
 type unoModelsResponse struct {
@@ -117,7 +118,16 @@ func (s *UnorouterScanner) ScanFreeModels(ctx context.Context, cfg config.Provid
 
 	var entries []catalog.CatalogEntry
 	for _, m := range ur.Data {
-		if m.ID == "" || !isEligibleModel(cfg.ID, m.ID, "", nil) {
+		if m.ID == "" {
+			continue
+		}
+		// Chat-capable check: endpoint metadata wins when exposed
+		// ("embedding"/"image-generation"/"aihorde" models cannot serve
+		// chat); otherwise the name-based filter below still applies.
+		if !unoChatCapable(m) {
+			continue
+		}
+		if !isEligibleModel(cfg.ID, m.ID, "", nil) {
 			continue
 		}
 		if !unoIsFree(m, cfg.Discovery.FreeMarkers) {
@@ -135,6 +145,28 @@ func (s *UnorouterScanner) ScanFreeModels(ctx context.Context, cfg config.Provid
 		})
 	}
 	return entries, nil
+}
+
+// unoChatCapable reports whether a discovered model can serve
+// OpenAI-compatible /chat/completions calls. UnoRouter publishes
+// supported_endpoint_types per model: "openai" marks chat capability,
+// while "embedding", "image-generation", "aihorde", … do not. Entries
+// without the field fall through to the name-based isEligibleModel filter.
+func unoChatCapable(m unoModel) bool {
+	if len(m.SupportedEndpointTypes) == 0 {
+		return true // unknown — decide by name in isEligibleModel
+	}
+	for _, t := range m.SupportedEndpointTypes {
+		if strings.EqualFold(t, "embedding") {
+			return false
+		}
+	}
+	for _, t := range m.SupportedEndpointTypes {
+		if strings.EqualFold(t, "openai") {
+			return true
+		}
+	}
+	return false
 }
 
 // unoIsFree decides whether a discovered UnoRouter model is on the free
@@ -205,6 +237,9 @@ func unoMetadata(m unoModel) map[string]any {
 	meta := map[string]any{}
 	if m.OwnedBy != "" {
 		meta["owned_by"] = m.OwnedBy
+	}
+	if len(m.SupportedEndpointTypes) > 0 {
+		meta["supported_endpoint_types"] = append([]string(nil), m.SupportedEndpointTypes...)
 	}
 	if m.IsFree != nil {
 		meta["is_free"] = *m.IsFree

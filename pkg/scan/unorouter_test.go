@@ -26,9 +26,12 @@ func TestUnorouterScanParsesModels(t *testing.T) {
 				{"id": "qwen/qwen3-235b-a22b:free", "object": "model", "created": 1735689600, "owned_by": "qwen", "context_length": 131072},
 				{"id": "qwen/qwen3-30b-a3b:free", "object": "model"},
 				{"id": "space-bunny-alpha:free", "object": "model"},
+				{"id": "aura-1:free", "object": "model", "supported_endpoint_types": ["openai"]},
 				{"id": "claude-sonnet-5-5", "object": "model", "pricing": {"prompt": "0.0005", "completion": "0.002"}},
 				{"id": "gpt-6-luna", "object": "model", "pricing": {"input": 0.05, "output": 0.10}},
 				{"id": "mimo-v2.6-pro", "object": "model"},
+				{"id": "horde-diffusion:free", "object": "model", "supported_endpoint_types": ["aihorde"]},
+				{"id": "embed-free-large:free", "object": "model", "supported_endpoint_types": ["openai", "embedding"]},
 				{"id": "free-embed-mini", "object": "model"}
 			]
 		}`))
@@ -52,9 +55,9 @@ func TestUnorouterScanParsesModels(t *testing.T) {
 		got = append(got, e.ModelID)
 		byID[e.ModelID] = e
 	}
-	want := []string{"qwen/qwen3-235b-a22b:free", "qwen/qwen3-30b-a3b:free", "space-bunny-alpha:free"}
+	want := []string{"qwen/qwen3-235b-a22b:free", "qwen/qwen3-30b-a3b:free", "space-bunny-alpha:free", "aura-1:free"}
 	if len(got) != len(want) {
-		t.Fatalf("entries = %v, want exactly %v (paid and embedding models must be excluded)", got, want)
+		t.Fatalf("entries = %v, want exactly %v (paid, embedding, and non-chat models must be excluded)", got, want)
 	}
 	for _, id := range want {
 		e, ok := byID[id]
@@ -115,6 +118,30 @@ func TestUnorouterFreeDetection(t *testing.T) {
 	}
 	if unoIsFree(unoModel{ID: "a:free"}, []string{"-gratis"}) {
 		t.Error("custom markers must replace the :free default")
+	}
+}
+
+// TestUnorouterChatCapability: endpoint metadata decides chat eligibility —
+// "openai" marks the OpenAI-compatible chat endpoint; "embedding",
+// "image-generation", and "aihorde" models cannot serve chat; entries
+// without the field defer to the name-based filter.
+func TestUnorouterChatCapability(t *testing.T) {
+	cases := []struct {
+		name  string
+		types []string
+		want  bool
+	}{
+		{"openai only", []string{"openai"}, true},
+		{"anthropic+openai", []string{"anthropic", "openai"}, true},
+		{"embedding excluded", []string{"openai", "embedding"}, false},
+		{"aihorde excluded", []string{"aihorde"}, false},
+		{"image-generation excluded", []string{"image-generation"}, false},
+		{"unknown defers to name filter", nil, true},
+	}
+	for _, c := range cases {
+		if got := unoChatCapable(unoModel{ID: "m", SupportedEndpointTypes: c.types}); got != c.want {
+			t.Errorf("%s: unoChatCapable = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
