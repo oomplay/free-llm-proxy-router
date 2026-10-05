@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
@@ -360,6 +362,99 @@ func poolProxyServer(s *Server) *httptest.Server {
 		}
 		s.serveDirectModel(w, r, s.cfg.Load(), s.catalog.Load(), req, raw)
 	}))
+}
+
+// TestStreamThroughMiddlewareIncremental: the PRODUCTION handler stack
+// (logging → recovery → auth, exactly as Start() wires it) must preserve
+// per-read SSE flushing. The logging middleware's responseWriter wrapper
+// must forward http.Flusher — without it the stream buffers until the
+// handler returns and clients lose streaming entirely. Regression for the
+// middleware Flush bug found in live E2E.
+func TestStreamThroughMiddlewareIncremental(t *testing.T) {
+	firstWrite := make(chan struct{})
+	proceed := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, sseEventOne)
+		close(firstWrite)
+		select {
+		case <-proceed:
+		case <-time.After(5 * time.Second):
+		}
+		writeSSE(w, sseEventTwo, sseDone)
+	}))
+	defer upstream.Close()
+
+	s := newPoolServer(t, upstream.URL, poolCatalogEntries()[:1])
+	// handleChatCompletions looks up strategy names in the registry — give it
+	// a real one (the chain itself is never reached here: the single
+	// candidate answers 200 immediately).
+	cfg := &config.Config{}
+	cfg.Providers = []config.ProviderConfig{{ID: "unorouter", BaseURL: upstream.URL, Enabled: true}}
+	cfg.Models.Canonicalization.Enabled = true
+	cfg.Models.Canonicalization.FreeOnly = true
+	cfg.Models.PublicAlias = "kiwi-auto"
+	s = NewServer(cfg, &catalog.Catalog{Entries: poolCatalogEntries()[:1]},
+		strategy.NewRegistry(nil, nil, "", "", 3, 5), nil, nil, nil)
+	// Wrap the mux exactly like Start() does: logging → recovery → auth.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	var handler http.Handler = mux
+	handler = loggingMiddleware(handler)
+	handler = recoveryMiddleware(handler)
+	handler = authMiddleware("", handler)
+	proxySrv := httptest.NewServer(handler)
+	defer proxySrv.Close()
+
+	type received struct {
+		text string
+		at   time.Duration
+	}
+	got := make(chan received, 8)
+	go func() {
+		conn, err := net.Dial("tcp", proxySrv.Listener.Addr().String())
+		if err != nil {
+			close(got)
+			return
+		}
+		defer conn.Close()
+		body := `{"model":"kiwi-auto","messages":[{"role":"user","content":"hi"}],"stream":true}`
+		conn.Write([]byte(fmt.Sprintf("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)))
+		start := time.Now()
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := conn.Read(buf)
+			if n > 0 {
+				got <- received{string(buf[:n]), time.Since(start)}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		close(got)
+	}()
+
+	var chunks []received
+	for c := range got {
+		chunks = append(chunks, c)
+	}
+	var firstEvent time.Duration
+	var done time.Duration
+	joined := ""
+	for _, c := range chunks {
+		joined += c.text
+		if firstEvent == 0 && strings.Contains(joined, "data: "+sseEventOne) {
+			firstEvent = c.at
+		}
+		if strings.Contains(c.text, "data: [DONE]") {
+			done = c.at
+		}
+	}
+	if firstEvent == 0 {
+		t.Fatalf("stream did not deliver event one; raw response:\n%s", joined)
+	}
+	if firstEvent >= done {
+		t.Fatalf("event one arrived at %v with DONE at %v — stream was buffered end-to-end (middleware must forward Flush)", firstEvent, done)
+	}
 }
 
 // TestPoolAliasFallbackChainKeepsPoolIdentity: when the alias walk exhausts

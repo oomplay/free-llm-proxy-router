@@ -48,6 +48,10 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 }
 
 // responseWriter wraps http.ResponseWriter to capture the status code.
+// It forwards Flush so streaming handlers keep their per-read flushing
+// through the middleware stack — without this, the http.Flusher type
+// assertion in StreamProxy.Forward fails and SSE responses buffer until
+// the handler returns.
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -56,4 +60,10 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
