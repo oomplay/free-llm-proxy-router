@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/alias"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
@@ -31,13 +32,18 @@ import (
 //   - HuggingFace 503+loading: wait estimated_time, retry SAME provider
 //   - Cerebras: pre-emptive slowdown if remaining-requests < 2
 type FallbackChain struct {
-	Cfg             *config.Config
-	Strategy        strategy.Strategy
-	Catalog         *catalog.Catalog
-	RateLimiter     *ratelimit.GlobalTracker
-	GeminiTracker   *ratelimit.GeminiTracker
+	Cfg                *config.Config
+	Strategy           strategy.Strategy
+	Catalog            *catalog.Catalog
+	RateLimiter        *ratelimit.GlobalTracker
+	GeminiTracker      *ratelimit.GeminiTracker
 	ReliabilityTracker *reliability.Tracker
-	HTTPClient      *http.Client
+	HTTPClient         *http.Client
+
+	// Resolver maps canonical model names to raw upstream model IDs for
+	// response rewriting (CanonicalFor). May be nil — nil means canonical
+	// aliasing is off and UsedModel keeps the raw upstream name.
+	Resolver *alias.Resolver
 }
 
 // Request is the parsed incoming chat-completions request.
@@ -282,7 +288,11 @@ func (fc *FallbackChain) callProvider(ctx context.Context, cfg config.ProviderCo
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
-	// Extract the actual model used (OpenRouter fills this in)
+	// Extract the actual model used (OpenRouter fills this in). The value
+	// only feeds the X-Used-Model header: when the upstream model belongs
+	// to a canonical alias group, the header reports the canonical name.
+	// The response body is returned verbatim, and the raw upstream identity
+	// is exposed via the X-Free-Router-Upstream-* headers.
 	usedModel := ""
 	if resp.StatusCode == http.StatusOK {
 		var parsed struct {
@@ -290,6 +300,17 @@ func (fc *FallbackChain) callProvider(ctx context.Context, cfg config.ProviderCo
 		}
 		if json.Unmarshal(respBody, &parsed) == nil {
 			usedModel = parsed.Model
+		}
+	}
+	if requested, ok := body["model"].(string); ok && requested != "" {
+		resp.Header.Set("X-Free-Router-Upstream-Provider", cfg.ID)
+		resp.Header.Set("X-Free-Router-Upstream-Model", requested)
+		if fc.Resolver != nil && usedModel != "" {
+			if canon := fc.Resolver.CanonicalFor(cfg.ID, usedModel); canon != "" {
+				usedModel = canon
+			} else if canon := fc.Resolver.CanonicalFor(cfg.ID, requested); canon != "" {
+				usedModel = canon
+			}
 		}
 	}
 

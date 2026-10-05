@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/alias"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
@@ -20,15 +21,20 @@ import (
 
 // Server is the OpenAI-compatible proxy server.
 type Server struct {
-	cfg             atomic.Pointer[config.Config]
-	catalog         atomic.Pointer[catalog.Catalog]
-	strategyReg     *strategy.Registry
-	rateLimiter     *ratelimit.GlobalTracker
-	geminiTracker   *ratelimit.GeminiTracker
+	cfg                atomic.Pointer[config.Config]
+	catalog            atomic.Pointer[catalog.Catalog]
+	strategyReg        *strategy.Registry
+	rateLimiter        *ratelimit.GlobalTracker
+	geminiTracker      *ratelimit.GeminiTracker
 	reliabilityTracker *reliability.Tracker
-	cache           *ResponseCache
-	streamProxy     *StreamProxy
-	httpServer      *http.Server
+	cache              *ResponseCache
+	streamProxy        *StreamProxy
+	httpServer         *http.Server
+
+	// aliasRes holds the canonical model alias resolver. It is rebuilt on
+	// every config or catalog reload. A nil result (aliasing disabled) means
+	// requests keep using raw model IDs only.
+	aliasRes atomic.Pointer[alias.Resolver]
 }
 
 // NewServer creates a new proxy Server.
@@ -50,17 +56,49 @@ func NewServer(
 	s.catalog.Store(cat)
 	s.cache = NewResponseCache(cfg.Proxy.CacheTTL)
 	s.streamProxy = &StreamProxy{HTTPClient: &http.Client{Timeout: 120 * time.Second}}
+	s.aliasRes.Store(buildAliasResolver(cfg, cat))
 	return s
 }
 
 // UpdateConfig hot-reloads the configuration.
 func (s *Server) UpdateConfig(cfg *config.Config) {
 	s.cfg.Store(cfg)
+	// Rebuild the alias layer from the new config against the current
+	// catalog (pure computation over in-memory data — cheap per reload).
+	s.aliasRes.Store(buildAliasResolver(cfg, s.catalog.Load()))
 }
 
 // UpdateCatalog hot-reloads the model catalog.
 func (s *Server) UpdateCatalog(cat *catalog.Catalog) {
 	s.catalog.Store(cat)
+	// Rebuild the alias layer so auto-derived canonical groups pick up
+	// added or removed upstream models.
+	s.aliasRes.Store(buildAliasResolver(s.cfg.Load(), cat))
+}
+
+// buildAliasResolver constructs the canonical model alias resolver from the
+// current config and catalog. It returns nil when the alias layer is
+// disabled; callers treat a nil resolver as "no canonical aliasing".
+//
+// Raw model IDs are reserved: a canonical name that exactly matches a raw
+// upstream ID is skipped, so the alias layer never shadows a model that
+// clients already request directly.
+func buildAliasResolver(cfg *config.Config, cat *catalog.Catalog) *alias.Resolver {
+	if cfg == nil || !cfg.Models.Canonicalization.Enabled {
+		return nil
+	}
+	var entries []catalog.CatalogEntry
+	reserved := map[string]bool{}
+	if cat != nil {
+		entries = cat.Entries
+		for _, e := range entries {
+			reserved[strings.ToLower(e.ModelID)] = true
+		}
+	}
+	return alias.NewResolver(entries, cfg.Models.Aliases, alias.Options{
+		FreeOnly: cfg.Models.Canonicalization.FreeOnly,
+		Reserved: reserved,
+	})
 }
 
 // Start begins listening on the configured port.
@@ -205,6 +243,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // Accepts both "model-id" and "provider/model-id" formats.
 // If all direct-provider attempts fail, falls back to the full strategy chain.
 func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *config.Config, cat *catalog.Catalog, req Request, raw map[string]any) {
+	// "raw:" prefix bypasses the alias layer entirely.
+	rawOnly := false
+	if rest, ok := strings.CutPrefix(req.Model, "raw:"); ok && rest != "" {
+		rawOnly = true
+		req.Model = rest
+		raw["model"] = rest
+	}
+
 	// Parse optional "provider/model" prefix.
 	// Pass 1 (full exact match) handles IDs like "meta-llama/llama-3.3-70b-instruct:free"
 	// where "/" is part of the model ID. Pass 2 handles "groq/llama-3.3-70b-versatile".
@@ -215,6 +261,10 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		targetModel = req.Model[idx+1:]
 	}
 
+	var resolver *alias.Resolver
+	if !rawOnly {
+		resolver = s.aliasRes.Load()
+	}
 	chain := &FallbackChain{
 		Cfg:                cfg,
 		Strategy:           nil,
@@ -223,6 +273,7 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		GeminiTracker:      s.geminiTracker,
 		ReliabilityTracker: s.reliabilityTracker,
 		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		Resolver:           resolver,
 	}
 
 	found := false
@@ -251,6 +302,9 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		// Any error or non-2xx — try next catalog entry.
 	}
 	if !found {
+		if s.serveAliasModel(w, r, cfg, cat, req, raw, resolver) {
+			return
+		}
 		http.Error(w, fmt.Sprintf(`{"error":"model %q not found in free catalog"}`, req.Model), http.StatusNotFound)
 		return
 	}
@@ -259,6 +313,58 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 	req.Model = ""
 	raw["model"] = ""
 	s.executeStrategyChain(w, r, cfg, cat, req, raw)
+}
+
+// serveAliasModel routes a request for a canonical model name to its ordered
+// upstream candidates. The first healthy upstream wins; if all fail, the
+// request falls back to the default strategy chain. Returns false when the
+// requested model is not a canonical alias, letting the caller keep its
+// existing 404 behavior.
+func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *config.Config, cat *catalog.Catalog, req Request, raw map[string]any, resolver *alias.Resolver) bool {
+	ups := resolver.Upstreams(req.Model)
+	if len(ups) == 0 {
+		return false
+	}
+	log.Printf("canonical alias: %q -> %d upstream candidate(s)", req.Model, len(ups))
+
+	chain := &FallbackChain{
+		Cfg:                cfg,
+		Strategy:           nil,
+		Catalog:            cat,
+		RateLimiter:        s.rateLimiter,
+		GeminiTracker:      s.geminiTracker,
+		ReliabilityTracker: s.reliabilityTracker,
+		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		Resolver:           resolver,
+	}
+	for _, u := range ups {
+		provCfg := findProviderCfg(cfg, u.ProviderID)
+		if provCfg == nil {
+			continue
+		}
+		body := copyMap(raw)
+		body["model"] = u.ModelID
+		delete(body, "stream")
+		for _, f := range anthropicOnlyFields {
+			delete(body, f)
+		}
+		resp, err := chain.callProvider(r.Context(), *provCfg, body)
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Used-Model", req.Model)
+			w.WriteHeader(resp.StatusCode)
+			w.Write(resp.Body)
+			return true
+		}
+		// Upstream failed (cooldown/retry already handled by callProvider
+		// callers upstream of this point) — try the next candidate.
+	}
+	// All alias upstreams failed — fall back to the default strategy chain.
+	log.Printf("alias route: all upstreams failed for %q — falling back to strategy chain", req.Model)
+	req.Model = ""
+	raw["model"] = ""
+	s.executeStrategyChain(w, r, cfg, cat, req, raw)
+	return true
 }
 
 // matchEntry reports whether a catalog entry matches the requested model.
@@ -300,6 +406,7 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 		GeminiTracker:      s.geminiTracker,
 		ReliabilityTracker: s.reliabilityTracker,
 		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		Resolver:           s.aliasRes.Load(),
 	}
 
 	// Always use the fallback chain regardless of stream flag.

@@ -230,3 +230,22 @@ providers:
     timeout: "120s"
     discovery:
       all_free: true
+
+# Canonical model aliases.
+#
+# A canonical name maps to the raw upstream model IDs that serve it. A
+# request for the canonical name tries the listed upstreams in order and
+# uses the first free success; the response body is returned verbatim and
+# the X-Used-Model header reports the canonical name. Every raw model ID
+# keeps working unchanged.
+models:
+  aliases:
+    # qwen3: OpenRouter's free Qwen3 235B first, Groq's qwen3-32b as backup.
+    qwen3:
+      - "qwen/qwen3-235b-a22b:free"
+      - "qwen3-32b"
+  canonicalization:
+    # Auto-derive canonical groups from the catalog by model family
+    # (every free qwen* entry joins the "qwen3" group, etc.).
+    enabled: true
+    free_only: true

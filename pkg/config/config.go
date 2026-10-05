@@ -15,10 +15,11 @@ import (
 
 // Config is the top-level configuration struct.
 type Config struct {
-	Proxy   ProxyConfig    `mapstructure:"proxy"`
-	Catalog CatalogConfig  `mapstructure:"catalog"`
-	Refresh RefreshConfig  `mapstructure:"refresh"`
-	Fallback FallbackConfig `mapstructure:"fallback"`
+	Proxy     ProxyConfig      `mapstructure:"proxy"`
+	Catalog   CatalogConfig    `mapstructure:"catalog"`
+	Refresh   RefreshConfig    `mapstructure:"refresh"`
+	Fallback  FallbackConfig   `mapstructure:"fallback"`
+	Models    ModelsConfig     `mapstructure:"models"`
 	Providers []ProviderConfig `mapstructure:"providers"`
 }
 
@@ -78,6 +79,33 @@ type GitSyncConfig struct {
 	// Replica role (all other machines):
 	RemoteURL    string `mapstructure:"remote_url"`
 	PullInterval string `mapstructure:"pull_interval"`
+}
+
+// ModelsConfig configures canonical model aliases.
+//
+// A canonical name ("qwen3") maps to the raw upstream model IDs that serve
+// it across providers. Requests naming a canonical model try the listed
+// upstreams in order and use the first free success. Response bodies are
+// returned verbatim; the X-Used-Model header reports the canonical name,
+// while the raw upstream identity stays in the X-Free-Router-Upstream-*
+// headers. Raw model IDs keep working unchanged.
+type ModelsConfig struct {
+	// Aliases maps canonical names to explicit lists of upstream model IDs.
+	// An entry replaces any auto-derived group with the same name.
+	Aliases map[string][]string `mapstructure:"aliases"`
+
+	// Canonicalization tunes automatic alias derivation from the catalog.
+	Canonicalization CanonicalizationConfig `mapstructure:"canonicalization"`
+}
+
+// CanonicalizationConfig controls auto-derivation of canonical model groups.
+type CanonicalizationConfig struct {
+	// Enabled turns on auto-grouping of catalog models into canonical
+	// families (e.g. every free qwen* entry joins the "qwen3" group).
+	Enabled bool `mapstructure:"enabled"`
+
+	// FreeOnly restricts auto-grouping to entries flagged as free tier.
+	FreeOnly bool `mapstructure:"free_only"`
 }
 
 // RefreshConfig holds the LLM-powered refresh settings.
@@ -222,6 +250,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("fallback.retry_on_429", true)
 	v.SetDefault("fallback.retry_on_5xx", true)
 	v.SetDefault("fallback.max_attempts", 5)
+	v.SetDefault("models.canonicalization.enabled", true)
+	v.SetDefault("models.canonicalization.free_only", true)
 	v.SetDefault("fallback.cerebras_request_spacing_ms", 100)
 	v.SetDefault("refresh.schedule", "weekly")
 	v.SetDefault("refresh.output_merge", "conservative")

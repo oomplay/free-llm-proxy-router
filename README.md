@@ -142,6 +142,26 @@ catalog:
   max_age_hours: 24      # Re-scan after this many hours
 ```
 
+### Canonical model aliases
+
+A canonical name (e.g. `qwen3`) can map to one or more raw upstream model IDs.
+A request for the canonical name tries the mapped upstreams in order and uses
+the first free success; the response body is returned verbatim and the
+`X-Used-Model` header reports the canonical name. Raw model IDs keep working
+unchanged.
+
+```yaml
+models:
+  aliases:
+    # OpenRouter's free Qwen3 235B first, Groq's qwen3-32b as backup.
+    qwen3:
+      - "qwen/qwen3-235b-a22b:free"
+      - "qwen3-32b"
+  canonicalization:
+    enabled: true    # Auto-derive groups from the catalog by model family
+    free_only: true  # Only map free upstream models
+```
+
 ## Catalog management
 
 ```bash
