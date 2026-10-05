@@ -52,6 +52,12 @@ type Request struct {
 	Messages []map[string]any `json:"messages"`
 	Stream   bool             `json:"stream,omitempty"`
 	MaxTokens int             `json:"max_tokens,omitempty"`
+	// ClientModel is the model name the client originally asked for, kept
+	// intact before any routing redirection (agent profiles, raw- prefix,
+	// alias-route fallback clearing). The pool-alias route uses it to keep
+	// X-Used-Model reporting the public identity across the strategy-chain
+	// fallback.
+	ClientModel string `json:"-"`
 	// Raw holds the original request body for passthrough.
 	Raw map[string]any `json:"-"`
 }

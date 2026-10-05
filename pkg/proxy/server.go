@@ -205,6 +205,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if m, ok := raw["model"].(string); ok {
 		req.Model = m
 	}
+	// Keep the client's original model name for header reporting across
+	// routing redirections (agent profiles, alias-route fallback clearing).
+	req.ClientModel = req.Model
 	if msgs, ok := raw["messages"].([]any); ok {
 		for _, msg := range msgs {
 			if m, ok := msg.(map[string]any); ok {
@@ -615,7 +618,16 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 		}
 	}
 	if resp.UsedModel != "" {
-		w.Header().Set("X-Used-Model", resp.UsedModel)
+		// Pool-alias requests keep the public identity: the client asked
+		// for kiwi-auto and must keep seeing kiwi-auto in X-Used-Model even
+		// when the strategy chain served the request after the alias walk
+		// exhausted — the real upstream stays in the X-Free-Router-Upstream-*
+		// headers.
+		if res := s.aliasRes.Load(); res != nil && res.IsPool(req.ClientModel) {
+			w.Header().Set("X-Used-Model", strings.ToLower(strings.TrimSpace(req.ClientModel)))
+		} else {
+			w.Header().Set("X-Used-Model", resp.UsedModel)
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)

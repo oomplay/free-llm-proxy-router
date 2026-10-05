@@ -12,6 +12,8 @@ import (
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/reliability"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/strategy"
 )
 
@@ -50,9 +52,10 @@ func poolCatalogEntries() []catalog.CatalogEntry {
 // serveDirectModel → serveAliasModel) for the given model name.
 func servePoolDirect(s *Server, model string, stream bool) *httptest.ResponseRecorder {
 	req := Request{
-		Model:    model,
-		Messages: []map[string]any{{"role": "user", "content": "hi"}},
-		Stream:   stream,
+		Model:       model,
+		ClientModel: model, // production: handleChatCompletions keeps the original name
+		Messages:    []map[string]any{{"role": "user", "content": "hi"}},
+		Stream:      stream,
 	}
 	raw := map[string]any{
 		"model":    model,
@@ -344,6 +347,7 @@ func poolProxyServer(s *Server) *httptest.Server {
 		if m, ok := raw["model"].(string); ok {
 			req.Model = m
 		}
+		req.ClientModel = req.Model // production parity
 		if msgs, ok := raw["messages"].([]any); ok {
 			for _, msg := range msgs {
 				if m, ok := msg.(map[string]any); ok {
@@ -356,6 +360,60 @@ func poolProxyServer(s *Server) *httptest.Server {
 		}
 		s.serveDirectModel(w, r, s.cfg.Load(), s.catalog.Load(), req, raw)
 	}))
+}
+
+// TestPoolAliasFallbackChainKeepsPoolIdentity: when the alias walk exhausts
+// on retryable failures and the strategy chain serves the request, the
+// client still sees X-Used-Model: kiwi-auto (the public identity), while the
+// upstream identity headers carry the real provider/model.
+func TestPoolAliasFallbackChainKeepsPoolIdentity(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		// 429 the alias walk (one call per candidate), then let the
+		// strategy chain's re-walk succeed.
+		if calls.Add(1) <= 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":"ok","object":"chat.completion","model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":"CHAIN_OK"},"finish_reason":"stop"}]}`, body.Model)
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{}
+	cfg.Proxy.Strategy = "adaptive"
+	cfg.Providers = []config.ProviderConfig{
+		{ID: "unorouter", BaseURL: upstream.URL, Enabled: true},
+	}
+	cfg.Models.Canonicalization.Enabled = true
+	cfg.Models.Canonicalization.FreeOnly = true
+	cfg.Models.PublicAlias = "kiwi-auto"
+	cat := &catalog.Catalog{Entries: []catalog.CatalogEntry{
+		{ProviderID: "unorouter", ModelID: "qwen3:free", IsFree: true},
+		{ProviderID: "unorouter", ModelID: "deepseek-v3:free", IsFree: true},
+	}}
+	s := NewServer(cfg, cat, strategy.NewRegistry(nil, nil, "", "", 3, 5),
+		ratelimit.NewGlobalTracker(), nil, reliability.New())
+
+	rec := servePoolDirect(s, "kiwi-auto", false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 via fallback chain; body: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Used-Model"); got != "kiwi-auto" {
+		t.Errorf("X-Used-Model = %q, want kiwi-auto (pool identity must survive the strategy-chain fallback)", got)
+	}
+	if got := rec.Header().Get("X-Free-Router-Upstream-Model"); got == "" {
+		t.Error("X-Free-Router-Upstream-Model must reveal the real upstream")
+	}
+	if !strings.Contains(rec.Body.String(), "CHAIN_OK") {
+		t.Errorf("body = %s, want the chain-served completion", rec.Body.String())
+	}
 }
 
 // poolStreamPost posts a streaming kiwi-auto request to the proxy server.
