@@ -351,6 +351,17 @@ func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *co
 		resp, err := chain.callProvider(r.Context(), *provCfg, body)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Printf("alias route: %s/%s served %q", u.ProviderID, u.ModelID, req.Model)
+			// Expose the raw upstream identity (documented contract) while
+			// X-Used-Model reports the canonical name. Only the router-owned
+			// headers are forwarded — upstream transport headers like
+			// Content-Length/Content-Encoding describe the buffered body
+			// callProvider read, not the bytes we are about to write.
+			if v := resp.Header.Get("X-Free-Router-Upstream-Provider"); v != "" {
+				w.Header().Set("X-Free-Router-Upstream-Provider", v)
+			}
+			if v := resp.Header.Get("X-Free-Router-Upstream-Model"); v != "" {
+				w.Header().Set("X-Free-Router-Upstream-Model", v)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Used-Model", req.Model)
 			w.WriteHeader(resp.StatusCode)
