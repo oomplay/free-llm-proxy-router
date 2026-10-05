@@ -148,7 +148,8 @@ A canonical name (e.g. `qwen3`) can map to one or more raw upstream model IDs.
 A request for the canonical name tries the mapped upstreams in order and uses
 the first free success; the response body is returned verbatim and the
 `X-Used-Model` header reports the canonical name. Raw model IDs keep working
-unchanged.
+unchanged. Canonical names are also advertised in `GET /v1/models` alongside
+the raw IDs, so clients can discover them like any other model.
 
 ```yaml
 models:

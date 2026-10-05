@@ -350,14 +350,21 @@ func (s *Server) serveAliasModel(w http.ResponseWriter, r *http.Request, cfg *co
 		}
 		resp, err := chain.callProvider(r.Context(), *provCfg, body)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Printf("alias route: %s/%s served %q", u.ProviderID, u.ModelID, req.Model)
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Used-Model", req.Model)
 			w.WriteHeader(resp.StatusCode)
 			w.Write(resp.Body)
 			return true
 		}
-		// Upstream failed (cooldown/retry already handled by callProvider
-		// callers upstream of this point) — try the next candidate.
+		// Upstream failed — record the candidate and the failure class,
+		// then try the next one (cooldown/retry already handled by
+		// callProvider callers upstream of this point).
+		if err != nil {
+			log.Printf("alias route: %s/%s error: %v — trying next candidate", u.ProviderID, u.ModelID, err)
+		} else {
+			log.Printf("alias route: %s/%s status %d — trying next candidate", u.ProviderID, u.ModelID, resp.StatusCode)
+		}
 	}
 	// All alias upstreams failed — fall back to the default strategy chain.
 	log.Printf("alias route: all upstreams failed for %q — falling back to strategy chain", req.Model)
@@ -439,7 +446,9 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 	w.Write(resp.Body)
 }
 
-// handleModels returns the list of available free models.
+// handleModels returns the list of available free models. Canonical alias
+// names are advertised after the raw upstream IDs so OpenAI-compatible
+// clients can discover and request them like any other model.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	cat := s.catalog.Load()
 	type modelEntry struct {
@@ -448,11 +457,28 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		Created int64  `json:"created"`
 	}
 	var models []modelEntry
+	listed := map[string]bool{}
 	for _, e := range cat.FreeEntries() {
+		listed[strings.ToLower(e.ModelID)] = true
 		models = append(models, modelEntry{
 			ID:     e.ModelID,
 			Object: "model",
 		})
+	}
+	// Canonical names come from the live resolver. Raw model IDs are
+	// reserved by the alias layer, so a name collision cannot happen; the
+	// listed check is belt-and-braces.
+	if res := s.aliasRes.Load(); res != nil {
+		for _, name := range res.Names() {
+			if listed[name] {
+				continue
+			}
+			listed[name] = true
+			models = append(models, modelEntry{
+				ID:     name,
+				Object: "model",
+			})
+		}
 	}
 	resp := map[string]any{
 		"object": "list",
