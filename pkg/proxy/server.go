@@ -674,7 +674,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if !exposeRaw && !exposeCanonical {
 		exposeRaw, exposeCanonical = true, true
 	}
-	var models []modelEntry
+	// Start non-nil so an empty catalog encodes as [] instead of null
+	// (some OpenAI-compatible clients reject a null data array).
+	models := make([]modelEntry, 0)
 	listed := map[string]bool{}
 	if exposeRaw {
 		for _, e := range cat.FreeEntries() {
